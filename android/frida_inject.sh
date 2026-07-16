@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
-#  frida_inject.sh — XAPK'a Frida Gadget otomatik enjeksiyon
-#  Kullanım: ./frida_inject.sh <dosya.xapk> <libfrida-gadget.so> [keystore] [keystore_pass]
+#  frida_inject.sh — XAPK/APK'ya Frida Gadget otomatik enjeksiyon
+#  Kullanım: ./frida_inject.sh <dosya.xapk|dosya.apk> <libfrida-gadget.so> [keystore] [keystore_pass]
 # ============================================================
 
 set -euo pipefail
@@ -12,15 +12,22 @@ ok()   { echo -e "${GREEN}[+]${NC} $1"; }
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 err()  { echo -e "${RED}[-]${NC} $1"; exit 1; }
 
-[ "$#" -lt 2 ] && err "Kullanım: $0 <dosya.xapk> <libfrida-gadget.so> [keystore] [keystore_pass]"
+[ "$#" -lt 2 ] && err "Kullanım: $0 <dosya.xapk|dosya.apk> <libfrida-gadget.so> [keystore] [keystore_pass]"
 
-XAPK="$(realpath "$1")"
+INPUT_FILE="$(realpath "$1")"
 GADGET_SO="$(realpath "$2")"
 KEYSTORE="${3:-}"
 KS_PASS="${4:-android}"
 
-[ ! -f "$XAPK" ]      && err "XAPK bulunamadı: $XAPK"
-[ ! -f "$GADGET_SO" ] && err "Gadget .so bulunamadı: $GADGET_SO"
+[ ! -f "$INPUT_FILE" ] && err "Girdi dosyası bulunamadı: $INPUT_FILE"
+[ ! -f "$GADGET_SO" ]  && err "Gadget .so bulunamadı: $GADGET_SO"
+
+# Girdi tipini uzantıya göre belirle
+case "${INPUT_FILE,,}" in
+    *.xapk) IS_XAPK=true ;;
+    *.apk)  IS_XAPK=false ;;
+    *) err "Desteklenmeyen dosya uzantısı (.xapk veya .apk olmalı): $INPUT_FILE" ;;
+esac
 
 for tool in apktool zipalign apksigner aapt adb unzip zip keytool python3; do
     command -v "$tool" &>/dev/null || err "'$tool' bulunamadı."
@@ -29,22 +36,36 @@ done
 WORKDIR="$(pwd)/frida_work_$(date +%s)"
 mkdir -p "$WORKDIR"
 log "Çalışma dizini: $WORKDIR"
+if $IS_XAPK; then
+    log "Girdi tipi: XAPK"
+else
+    log "Girdi tipi: APK (tekil paket, split yok)"
+fi
 
 # ============================================================
-# ADIM 1 — XAPK'ı aç
+# ADIM 1 — Girdi dosyası hazırlanıyor
 # ============================================================
-log "ADIM 1: XAPK açılıyor..."
+log "ADIM 1: Girdi dosyası hazırlanıyor..."
 XAPK_DIR="$WORKDIR/xapk"
 mkdir -p "$XAPK_DIR"
-unzip -q "$XAPK" -d "$XAPK_DIR"
 
-BASE_APK=$(find "$XAPK_DIR" -maxdepth 1 -name "*.apk" ! -name "config.*" | sort | head -1)
-[ -z "$BASE_APK" ] && err "Base APK bulunamadı!"
+if $IS_XAPK; then
+    unzip -q "$INPUT_FILE" -d "$XAPK_DIR"
 
-CONFIG_ARM64=$(find "$XAPK_DIR" -maxdepth 1 -name "config.arm64_v8a.apk" | head -1)
-[ -z "$CONFIG_ARM64" ] && warn "config.arm64_v8a.apk bulunamadı — gadget base APK'ya eklenecek"
+    BASE_APK=$(find "$XAPK_DIR" -maxdepth 1 -name "*.apk" ! -name "config.*" | sort | head -1)
+    [ -z "$BASE_APK" ] && err "Base APK bulunamadı!"
 
-ok "ADIM 1: XAPK açıldı — Base: $(basename "$BASE_APK")"
+    CONFIG_ARM64=$(find "$XAPK_DIR" -maxdepth 1 -name "config.arm64_v8a.apk" | head -1)
+    [ -z "$CONFIG_ARM64" ] && warn "config.arm64_v8a.apk bulunamadı — gadget base APK'ya eklenecek"
+
+    ok "ADIM 1: XAPK açıldı — Base: $(basename "$BASE_APK")"
+else
+    # Tekil APK: split/config APK yok, gadget doğrudan base APK'ya eklenecek
+    BASE_APK="$XAPK_DIR/$(basename "$INPUT_FILE")"
+    cp "$INPUT_FILE" "$BASE_APK"
+    CONFIG_ARM64=""
+    ok "ADIM 1: APK hazırlandı — $(basename "$BASE_APK")"
+fi
 
 # ============================================================
 # ADIM 2 — Gadget config
@@ -317,21 +338,32 @@ ok "ADIM 10: Tüm APK'lar imzalandı"
 # ============================================================
 # ADIM 11 — ADB install
 # ============================================================
-log "ADIM 11: ADB install-multiple..."
+log "ADIM 11: ADB install..."
 ADB_DEV=$(adb devices 2>/dev/null | grep -v "List of devices" | grep -c "device$") || ADB_DEV=0
+
+SIGNED_APKS=("$SIGNED_DIR"/*.apk)
+NUM_SIGNED=${#SIGNED_APKS[@]}
 
 if [ "$ADB_DEV" -eq 0 ]; then
     warn "Cihaz bulunamadı. Manuel yükle:"
     echo ""
     echo "  cd \"$SIGNED_DIR\""
-    echo "  adb install-multiple --no-incremental *.apk"
+    if [ "$NUM_SIGNED" -gt 1 ]; then
+        echo "  adb install-multiple --no-incremental *.apk"
+    else
+        echo "  adb install -r \"$(basename "${SIGNED_APKS[0]}")\""
+    fi
     echo ""
 else
     PKG=$(aapt dump badging "$BASE_APK" 2>/dev/null | grep "^package:" | grep -o "name='[^']*'" | cut -d"'" -f2) || PKG=""
     [ -n "$PKG" ] && { log "Kaldırılıyor: $PKG"; adb uninstall "$PKG" 2>/dev/null || true; }
 
     cd "$SIGNED_DIR"
-    adb install-multiple --no-incremental *.apk
+    if [ "$NUM_SIGNED" -gt 1 ]; then
+        adb install-multiple --no-incremental *.apk
+    else
+        adb install -r "$(basename "${SIGNED_APKS[0]}")"
+    fi
     cd "$WORKDIR"
     ok "Yükleme başarılı!"
 
